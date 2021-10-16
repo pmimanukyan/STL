@@ -1,107 +1,248 @@
-#include <algorithm>
-#include <iostream>
-#include <memory>
+#pragma once
+
+#include <cstddef>  // std::nullptr_t
 #include <utility>
+#include <algorithm>
 
-template<typename T>
-class SharedPtr {
-private:
-    T* ptr;
-    size_t* k;
-
-    void dec() noexcept {
-        if (nullptr == ptr) {
-            return;
-        }
-        if ((*k) == 1) {
-            delete k;
-            delete ptr;
-            return;
-        }
-        --(*k);
-    }
-
-    void inc() {
-        if (nullptr != ptr) {
-            if (nullptr == k) {
-                k = new size_t(0);
-            }
-            ++(*k);
-        }
-    }
-
+class ControlBlockBase {
 public:
-    SharedPtr() : ptr(nullptr), k(nullptr) {}
+    size_t ref_counter_{};
 
-    SharedPtr(T* ptr) : ptr(ptr), k(nullptr) {
-        inc();
+    virtual ~ControlBlockBase() = default;
+};
+
+template <typename U>
+class ControlBlockPointer : public ControlBlockBase {
+public:
+    U* ptr_;
+    ControlBlockPointer(U* ptr) : ptr_(ptr) {
+    }
+    ~ControlBlockPointer() {
+        delete ptr_;
+    }
+};
+
+template <typename U>
+class ControlBlockHolder : public ControlBlockBase {
+public:
+    template <typename... Args>
+    ControlBlockHolder(Args&&... args) {
+        new (&storage_) U(std::forward<Args>(args)...);
+        ++ref_counter_;
     }
 
-    SharedPtr(const SharedPtr& rhs) : ptr(rhs.ptr), k(rhs.k) {
-        inc();
+    U* GetRawPtr() {
+        return reinterpret_cast<U*>(&storage_);
     }
 
-    SharedPtr(SharedPtr&& rhs) : ptr(rhs.ptr), k(rhs.k) {
-        rhs.ptr = nullptr;
-        rhs.k = nullptr;
+    ~ControlBlockHolder() {
+        reinterpret_cast<U*>(&storage_)->~U();
     }
 
-    SharedPtr& operator= (const SharedPtr& rhs) {
-        if (ptr != rhs.ptr) {
-            dec();
-            k = rhs.k;
-            ptr = rhs.ptr;
-            inc();
+    std::aligned_storage_t<sizeof(U), alignof(U)> storage_;
+};
+// https://en.cppreference.com/w/cpp/memory/shared_ptr
+template <typename T>
+class SharedPtr {
+public:
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Constructors
+
+    SharedPtr() = default;
+
+    SharedPtr(std::nullptr_t) : ptr_(nullptr), block_(nullptr) {
+    }
+
+    template <typename U>
+    explicit SharedPtr(U* ptr) : ptr_(ptr), block_(new ControlBlockPointer<U>(ptr)) {
+        Increasing();
+    }
+
+    SharedPtr(const SharedPtr& other) : ptr_(other.ptr_), block_(other.block_) {
+        Increasing();
+    }
+
+    template <typename U>
+    SharedPtr(const SharedPtr<U>& other) : ptr_(other.ptr_), block_(other.block_) {
+        Increasing();
+    }
+
+    SharedPtr(SharedPtr&& other) : ptr_(other.ptr_), block_(other.block_) {
+        other.ptr_ = nullptr;
+        other.block_ = nullptr;
+    }
+
+    template <typename U>
+    SharedPtr(SharedPtr<U>&& other) : ptr_(other.ptr_), block_(other.block_) {
+        other.ptr_ = nullptr;
+        other.block_ = nullptr;
+    }
+
+    // Aliasing constructor
+    // #8 from https://en.cppreference.com/w/cpp/memory/shared_ptr/shared_ptr
+    template <typename U>
+    SharedPtr(const SharedPtr<U>& other, T* ptr) : ptr_(ptr), block_(other.block_) {
+        Increasing();
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // `operator=`-s
+    SharedPtr& operator=(const SharedPtr& other) {
+        if (ptr_ == other.ptr_) {
+            return *this;
         }
+        Decrasing();
+        ptr_ = other.ptr_;
+        block_ = other.block_;
+        Increasing();
         return *this;
     }
 
-    SharedPtr& operator= (SharedPtr&& rhs) {
-        if (ptr != rhs.ptr) {
-            dec();
-            k = rhs.k;
-            ptr = rhs.ptr;
-            rhs.ptr = nullptr;
-            rhs.k = nullptr;
+    template <typename U>
+    SharedPtr& operator=(const SharedPtr<U>& other) {
+        if (ptr_ == other.ptr_) {
+            return *this;
         }
+        Decrasing();
+        ptr_ = other.ptr_;
+        block_ = other.block_;
+        Increasing();
         return *this;
     }
 
-    T& operator*() {
-        return *ptr;
+    SharedPtr& operator=(SharedPtr&& other) {
+        if (ptr_ == other.ptr_) {
+            return *this;
+        }
+        Decrasing();
+        ptr_ = other.ptr_;
+        block_ = other.block_;
+        other.ptr_ = nullptr;
+        other.block_ = nullptr;
+        return *this;
     }
 
-    const T& operator*() const {
-        return *ptr;
+    template <typename U>
+    SharedPtr& operator=(SharedPtr<U>&& other) {
+        if (ptr_ == other.ptr_) {
+            return *this;
+        }
+        Decrasing();
+        ptr_ = other.ptr_;
+        block_ = other.block_;
+        other.ptr_ = nullptr;
+        other.block_ = nullptr;
+        return *this;
     }
 
-    const T* operator->() const {
-        return ptr;
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Destructor
+
+    ~SharedPtr() noexcept {
+        Decrasing();
     }
 
-    T* get() const {
-        return ptr;
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Modifiers
+
+    void Reset() {
+        Decrasing();
+        ptr_ = nullptr;
+        block_ = nullptr;
+        Increasing();
     }
 
-    operator bool() const noexcept {
-        return (nullptr != ptr);
+    void Reset(T* ptr) {
+        Decrasing();
+        ptr_ = ptr;
+        block_ = new ControlBlockPointer<T>(ptr);
+        Increasing();
     }
 
-    void reset(T* p) {
-        if (ptr != p) {
-            dec();
-            ptr = p;
-            k = nullptr;
-            inc();
+    template <typename U>
+    void Reset(U* ptr) {
+        Decrasing();
+        ptr_ = ptr;
+        block_ = new ControlBlockPointer<U>(ptr);
+        Increasing();
+    }
+
+    void Swap(SharedPtr& other) {
+        std::swap(ptr_, other.ptr_);
+        std::swap(block_, other.block_);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Observers
+
+    T* Get() const {
+        return ptr_;
+    }
+
+    T& operator*() const {
+        return *ptr_;
+    }
+
+    T* operator->() const {
+        return ptr_;
+    }
+
+    size_t UseCount() const {
+        return block_ == nullptr ? 0 : block_->ref_counter_;
+    }
+
+    explicit operator bool() const {
+        if (ptr_) {
+            return true;
+        } else {
+            return false;
         }
     }
 
-    void swap(SharedPtr& other) noexcept {
-        std::swap(ptr, other.ptr);
-        std::swap(k, other.k);
+    void Decrasing() {
+        if (block_ != nullptr) {
+            if (block_->ref_counter_ == 1) {
+                delete block_;
+                return;
+            }
+            --block_->ref_counter_;
+        }
     }
 
-    ~SharedPtr() {
-        dec();
+    void Increasing() {
+        if (ptr_ != nullptr || block_ != nullptr) {
+            ++block_->ref_counter_;
+        }
     }
+
+private:
+    T* ptr_ = nullptr;
+    ControlBlockBase* block_ = nullptr;
+
+    template <typename Y, typename... Args>
+    friend SharedPtr<Y> MakeShared(Args&&... args);
+
+    template <typename U>
+    friend class SharedPtr;
+};
+
+template <typename T, typename U>
+inline bool operator==(const SharedPtr<T>& left, const SharedPtr<U>& right);
+
+// Allocate memory only once
+template <typename T, typename... Args>
+SharedPtr<T> MakeShared(Args&&... args) {
+    SharedPtr<T> sp;
+    auto block = new ControlBlockHolder<T>(std::forward<Args>(args)...);
+    sp.block_ = block;
+    sp.ptr_ = block->GetRawPtr();
+    return sp;
+}
+
+// Look for usage examples in tests
+template <typename T>
+class EnableSharedFromThis {
+public:
+    SharedPtr<T> SharedFromThis();
+    SharedPtr<const T> SharedFromThis() const;
 };
